@@ -1,4 +1,7 @@
-use rusty_money::{crypto, iso};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use rusty_money::{crypto, iso, Locale};
 use serde::{Deserialize, Serialize};
 
 use cel_interpreter::{CelResult, CelType, CelValue, ResultCoercionError};
@@ -183,6 +186,54 @@ impl Currency {
             Currency::Crypto(c) => c.code,
         }
     }
+
+    /// Register a consumer currency for `FromStr` / serde / CEL.
+    ///
+    /// Leaks the code once into process memory so `Currency` can stay `Copy`.
+    /// Built-in ISO and crypto table codes cannot be shadowed.
+    pub fn register(code: &str) -> Result<Self, ParseCurrencyError> {
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(ParseCurrencyError::UnknownCurrency(code.to_string()));
+        }
+        if iso::find(code).is_some() || crypto::find(code).is_some() {
+            return Err(ParseCurrencyError::UnknownCurrency(code.to_string()));
+        }
+
+        let mut registry = custom_currency_registry()
+            .lock()
+            .expect("currency registry poisoned");
+        if let Some(existing) = registry.get(code) {
+            return Ok(*existing);
+        }
+
+        let leaked_code: &'static str = Box::leak(code.to_owned().into_boxed_str());
+        let leaked_currency: &'static crypto::Currency = Box::leak(Box::new(crypto::Currency {
+            code: leaked_code,
+            exponent: 0,
+            locale: Locale::EnUs,
+            minor_units: 1,
+            name: leaked_code,
+            symbol: leaked_code,
+            symbol_first: false,
+        }));
+        let registered = Self::Crypto(leaked_currency);
+        registry.insert(leaked_code, registered);
+        Ok(registered)
+    }
+
+    fn find_custom(code: &str) -> Option<Self> {
+        custom_currency_registry()
+            .lock()
+            .expect("currency registry poisoned")
+            .get(code)
+            .copied()
+    }
+}
+
+fn custom_currency_registry() -> &'static Mutex<HashMap<&'static str, Currency>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<&'static str, Currency>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl std::fmt::Display for Currency {
@@ -231,13 +282,16 @@ impl std::str::FromStr for Currency {
     type Err = ParseCurrencyError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match iso::find(s) {
-            Some(c) => Ok(Currency::Iso(c)),
-            _ => match crypto::find(s) {
-                Some(c) => Ok(Currency::Crypto(c)),
-                _ => Err(ParseCurrencyError::UnknownCurrency(s.to_string())),
-            },
+        if let Some(c) = iso::find(s) {
+            return Ok(Currency::Iso(c));
         }
+        if let Some(c) = crypto::find(s) {
+            return Ok(Currency::Crypto(c));
+        }
+        if let Some(c) = Self::find_custom(s) {
+            return Ok(c);
+        }
+        Err(ParseCurrencyError::UnknownCurrency(s.to_string()))
     }
 }
 
@@ -279,11 +333,63 @@ impl TryFrom<CelResult<'_>> for Currency {
 
 #[cfg(test)]
 mod tests {
-    use crate::primitives::Currency;
+    use crate::primitives::{Currency, ParseCurrencyError};
 
     #[test]
     fn currency_constants() {
         assert_eq!(Currency::USD, "USD".parse().unwrap());
         assert_eq!(Currency::BTC, "BTC".parse().unwrap());
+    }
+
+    #[test]
+    fn register_custom_currency_parses() {
+        let registered = Currency::register("FOO").unwrap();
+        assert_eq!(registered.code(), "FOO");
+        assert_eq!("FOO".parse::<Currency>().unwrap(), registered);
+        assert_eq!(registered, Currency::register("FOO").unwrap());
+    }
+
+    #[test]
+    fn register_custom_currency_serde_round_trip() {
+        let registered = Currency::register("XYZ").unwrap();
+        let json = serde_json::to_string(&registered).unwrap();
+        assert_eq!(json, "\"XYZ\"");
+        let back: Currency = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, registered);
+        assert_eq!(back.code(), "XYZ");
+    }
+
+    #[test]
+    fn register_rejects_iso_and_crypto_shadow() {
+        assert!(matches!(
+            Currency::register("USD"),
+            Err(ParseCurrencyError::UnknownCurrency(_))
+        ));
+        assert!(matches!(
+            Currency::register("BTC"),
+            Err(ParseCurrencyError::UnknownCurrency(_))
+        ));
+        assert!(matches!(
+            "USD".parse::<Currency>().unwrap(),
+            Currency::Iso(_)
+        ));
+        assert!(matches!(
+            "BTC".parse::<Currency>().unwrap(),
+            Currency::Crypto(_)
+        ));
+    }
+
+    #[test]
+    fn register_rejects_empty_or_blank() {
+        assert!(Currency::register("").is_err());
+        assert!(Currency::register("   ").is_err());
+    }
+
+    #[test]
+    fn unregistered_currency_still_unknown() {
+        assert!(matches!(
+            "NOTAREALCURRENCYCODE".parse::<Currency>(),
+            Err(ParseCurrencyError::UnknownCurrency(_))
+        ));
     }
 }
